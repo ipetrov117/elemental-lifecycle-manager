@@ -18,8 +18,25 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"regexp"
+	"strings"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// Label identification for a Release resource.
+const (
+	ReleaseNameLabel    = "lifecycle.suse.com/release"
+	ReleaseVersionLabel = "lifecycle.suse.com/version"
+)
+
+var namingRegex = regexp.MustCompile(`[^a-z0-9-]+`)
+
+// SanitizeVersion converts a version string to a valid Kubernetes name suffix.
+func SanitizeVersion(version string) string {
+	norm := namingRegex.ReplaceAllString(strings.ToLower(version), "-")
+	return strings.Trim(norm, "-")
+}
 
 // Condition types for Release status.
 const (
