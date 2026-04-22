@@ -72,6 +72,9 @@ const (
 
 	// UpgradeFailed indicates that the upgrade process has failed.
 	UpgradeFailed = "Failed"
+
+	// PlanComplete indicates that a SUC Plan related to the upgrade process has completed.
+	PlanComplete = "PlanComplete"
 )
 
 // ReleaseSpec defines the desired state of Release
