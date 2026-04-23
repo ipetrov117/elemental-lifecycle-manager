@@ -30,9 +30,12 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	upgradecattlev1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
 	lifecyclev1alpha1 "github.com/suse/elemental-lifecycle-manager/api/v1alpha1"
+	"github.com/suse/elemental-lifecycle-manager/internal/plan"
 	releasecache "github.com/suse/elemental-lifecycle-manager/internal/release"
 	"github.com/suse/elemental-lifecycle-manager/internal/upgrade"
 	"github.com/suse/elemental/v3/pkg/manifest/resolver"
@@ -183,6 +186,7 @@ func (r *ReleaseReconciler) getOrRetrieveManifest(ctx context.Context, release *
 	return manifest, nil
 }
 
+// parseDrainOpts generates drain configuration for the cluster nodes
 func (r *ReleaseReconciler) parseDrainOpts(ctx context.Context, release *lifecyclev1alpha1.Release) (*upgrade.DrainOpts, error) {
 	if release.Spec.DisableDrain {
 		return &upgrade.DrainOpts{ControlPlane: false, Worker: false}, nil
@@ -195,8 +199,7 @@ func (r *ReleaseReconciler) parseDrainOpts(ctx context.Context, release *lifecyc
 
 	var controlPlaneCounter, workerCounter int
 	for _, node := range nodeList.Items {
-		// TODO: move control-plane label under 'plan' package when SUC plan logic is introduced
-		if _, isControlPlane := node.Labels["node-role.kubernetes.io/control-plane"]; isControlPlane {
+		if _, isControlPlane := node.Labels[plan.ControlPlaneLabel]; isControlPlane {
 			controlPlaneCounter++
 		} else {
 			workerCounter++
@@ -224,10 +227,36 @@ func (r *ReleaseReconciler) parseUpgradeConfig(ctx context.Context, manifest *re
 	return upgrade.NewConfig(manifest, release.Spec.Version, types.NamespacedName{Name: release.Name, Namespace: release.Namespace}, opts)
 }
 
+// mapPlanToRelease maps SUC Plan events to Release reconcile requests.
+// Uses the release name label on the Plan to find the corresponding Release.
+func (r *ReleaseReconciler) mapPlanToRelease(ctx context.Context, obj client.Object) []ctrl.Request {
+	releaseName := obj.GetLabels()[lifecyclev1alpha1.ReleaseNameLabel]
+	if releaseName == "" {
+		return nil
+	}
+
+	releaseList := &lifecyclev1alpha1.ReleaseList{}
+	if err := r.List(ctx, releaseList); err != nil {
+		return nil
+	}
+
+	for _, rel := range releaseList.Items {
+		if rel.Name == releaseName {
+			return []ctrl.Request{{
+				NamespacedName: client.ObjectKeyFromObject(&rel),
+			}}
+		}
+	}
+
+	return nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ReleaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&lifecyclev1alpha1.Release{}).
+		// Ensure we reconcile on any event change relating to SUC Plans created by the controller
+		Watches(&upgradecattlev1.Plan{}, handler.EnqueueRequestsFromMapFunc(r.mapPlanToRelease)).
 		Named("release").
 		Complete(r)
 }
