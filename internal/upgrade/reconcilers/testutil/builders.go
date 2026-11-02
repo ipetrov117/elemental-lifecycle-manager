@@ -94,6 +94,12 @@ func WithDependencies(dependencies []api.HelmChartDependency) HelmChartOpts {
 	}
 }
 
+func WithPriorityUpgrade(priority bool) HelmChartOpts {
+	return func(h *api.HelmChart) {
+		h.PriorityUpgrade = priority
+	}
+}
+
 // NewTestHelmChart creates a test api.HelmChart.
 func NewTestHelmChart(name, version string, opts ...HelmChartOpts) *api.HelmChart {
 	chart := &api.HelmChart{

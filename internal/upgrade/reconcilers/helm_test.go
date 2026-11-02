@@ -62,14 +62,17 @@ var _ = Describe("HelmReconciler", func() {
 		scheme = testutil.NewTestScheme()
 		fakeClient = testutil.NewFakeClient(scheme)
 		mockHelm = testutil.NewMockHelmClient()
-		reconciler = reconcilers.NewHelmReconciler(fakeClient, mockHelm, false)
+		reconciler = reconcilers.NewHelmReconciler(fakeClient, mockHelm)
 	})
 
-	Describe("Phase", func() {
-		It("should return PhaseHelmCharts", func() {
-			Expect(reconciler.Phase()).To(Equal(upgrade.PhaseHelmCharts))
-		})
-	})
+	DescribeTable("Phase",
+		func(newReconciler func(client.Client, helm.Client) *reconcilers.HelmReconciler, expected upgrade.Phase) {
+			Expect(newReconciler(fakeClient, mockHelm).Phase()).To(Equal(expected))
+		},
+		Entry("NewHelmReconciler", baseReconcilerWrapper, upgrade.PhaseHelmCharts),
+		Entry("NewPriorityHelmReconciler", reconcilers.NewPriorityHelmReconciler, upgrade.PhasePriorityHelmCharts),
+		Entry("NewStandardHelmReconciler", reconcilers.NewStandardHelmReconciler, upgrade.PhaseHelmCharts),
+	)
 
 	Describe("Reconcile", func() {
 		Context("when HelmCharts config is nil", func() {
@@ -538,7 +541,71 @@ var _ = Describe("HelmReconciler", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(status.State).To(Equal(lifecyclev1alpha1.UpgradeSucceeded))
 			})
+
+			DescribeTable("should handle failed job based on upgrade policy",
+				func(newReconciler func(client.Client, helm.Client) *reconcilers.HelmReconciler, priority, strict bool) {
+					const chart2Name = "chart2"
+
+					helmChart.Status.JobName = testChart1Job
+					Expect(fakeClient.Update(ctx, helmChart)).To(Succeed())
+
+					job := testutil.NewTestJob(testChart1Job, reconcilers.HelmChartNamespace, false)
+					job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}}
+					Expect(fakeClient.Create(ctx, job)).To(Succeed())
+
+					// chart2 depends on chart1 to guarantee that chart1 is processed first.
+					config = testutil.NewTestConfig(testutil.WithHelmChartConfig([]*upgrade.HelmChartConfig{
+						{Chart: testutil.NewTestHelmChart(chart2Name, testChartVersion,
+							testutil.WithPriorityUpgrade(priority),
+							testutil.WithDependencies([]api.HelmChartDependency{{Name: testChart1Name, Type: api.DependencyTypeHelm}}),
+						)},
+						{Chart: testutil.NewTestHelmChart(testChart1Name, testChartVersion, testutil.WithPriorityUpgrade(priority))},
+					}))
+
+					var processed []string
+					mockHelm.RetrieveReleaseFn = func(name string) (*helm.ReleaseInfo, error) {
+						processed = append(processed, name)
+						return &helm.ReleaseInfo{ChartVersion: testChartVersion, Namespace: testNamespace}, nil
+					}
+
+					status, err := newReconciler(fakeClient, mockHelm).Reconcile(ctx, config)
+
+					Expect(status.State).To(Equal(lifecyclev1alpha1.UpgradeFailed))
+					if strict {
+						Expect(err).To(MatchError(ContainSubstring(`upgrading chart "chart1"`)))
+						Expect(processed).To(Equal([]string{testChart1Name}))
+					} else {
+						Expect(err).NotTo(HaveOccurred())
+						Expect(processed).To(Equal([]string{testChart1Name, chart2Name}))
+					}
+				},
+				Entry("NewHelmReconciler continues with remaining charts", baseReconcilerWrapper, false, false),
+				Entry("NewPriorityHelmReconciler fails and stops processing", reconcilers.NewPriorityHelmReconciler, true, true),
+				Entry("NewStandardHelmReconciler continues with remaining charts", reconcilers.NewStandardHelmReconciler, false, false),
+			)
 		})
+
+		DescribeTable("should select charts according to the reconciler constructor",
+			func(newReconciler func(client.Client, helm.Client) *reconcilers.HelmReconciler, expected []string) {
+				config = testutil.NewTestConfig(testutil.WithHelmChartConfig([]*upgrade.HelmChartConfig{
+					{Chart: testutil.NewTestHelmChart("priority", testChartVersion, testutil.WithPriorityUpgrade(true))},
+					{Chart: testutil.NewTestHelmChart("standard", testChartVersion)},
+				}))
+
+				var processed []string
+				mockHelm.RetrieveReleaseFn = func(name string) (*helm.ReleaseInfo, error) {
+					processed = append(processed, name)
+					return &helm.ReleaseInfo{ChartVersion: testChartVersion, Namespace: testNamespace}, nil
+				}
+
+				_, err := newReconciler(fakeClient, mockHelm).Reconcile(ctx, config)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(processed).To(Equal(expected))
+			},
+			Entry("NewHelmReconciler should select all charts", baseReconcilerWrapper, []string{"priority", "standard"}),
+			Entry("NewPriorityHelmReconciler should select only priority charts", reconcilers.NewPriorityHelmReconciler, []string{"priority"}),
+			Entry("NewStandardHelmReconciler should select only standard charts", reconcilers.NewStandardHelmReconciler, []string{"standard"}),
+		)
 	})
 
 	Describe("dependency ordering (tested indirectly)", func() {
@@ -615,3 +682,7 @@ var _ = Describe("HelmReconciler", func() {
 		})
 	})
 })
+
+func baseReconcilerWrapper(c client.Client, h helm.Client) *reconcilers.HelmReconciler {
+	return reconcilers.NewHelmReconciler(c, h)
+}

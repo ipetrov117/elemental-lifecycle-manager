@@ -41,7 +41,6 @@ import (
 	lifecyclev1alpha1 "github.com/suse/elemental-lifecycle-manager/api/v1alpha1"
 	"github.com/suse/elemental-lifecycle-manager/internal/helm"
 	"github.com/suse/elemental-lifecycle-manager/internal/upgrade"
-	"github.com/suse/elemental/v3/pkg/manifest/api"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
 
@@ -67,27 +66,89 @@ type HelmReconciler struct {
 	releaseVersion string
 	// strict defines if the reconciler should fail on upgrade of a chart
 	strict bool
+	// phase is the upgrade phase that this reconciler serves
+	phase upgrade.Phase
+	// chartSelector selects the charts that this reconciler will handle from a given
+	// upgrade configuration
+	chartSelector func(config *upgrade.Config) (upgrade.HelmChartConfigs, error)
 }
 
-// NewHelmReconciler creates a new Helm reconciler.
-func NewHelmReconciler(c client.Client, h helm.Client, strict bool) *HelmReconciler {
-	return &HelmReconciler{
+type HelmReconcilerOpts func(h *HelmReconciler)
+
+func WithChartSelector(s func(config *upgrade.Config) (upgrade.HelmChartConfigs, error)) HelmReconcilerOpts {
+	return func(h *HelmReconciler) {
+		h.chartSelector = s
+	}
+}
+
+func WithCustomPhase(p upgrade.Phase) HelmReconcilerOpts {
+	return func(h *HelmReconciler) {
+		h.phase = p
+	}
+}
+
+func WithStrictUpgradePolicy() HelmReconcilerOpts {
+	return func(h *HelmReconciler) {
+		h.strict = true
+	}
+}
+
+// NewHelmReconciler returns a Helm reconciler skeleton that can be modified for custom use-cases.
+func NewHelmReconciler(c client.Client, h helm.Client, opts ...HelmReconcilerOpts) *HelmReconciler {
+	r := &HelmReconciler{
 		Client:     c,
 		helmClient: h,
-		strict:     strict,
+		phase:      upgrade.PhaseHelmCharts,
+		chartSelector: func(config *upgrade.Config) (upgrade.HelmChartConfigs, error) {
+			return config.HelmCharts.FilterWithDependencies(func(*upgrade.HelmChartConfig) bool { return true })
+		},
 	}
+
+	for _, o := range opts {
+		o(r)
+	}
+
+	return r
+}
+
+// NewPriorityHelmReconciler returns a Helm reconciler that reconciles only the priority charts from a given upgrade configuration.
+func NewPriorityHelmReconciler(c client.Client, h helm.Client) *HelmReconciler {
+	prioritySelector := func(config *upgrade.Config) (upgrade.HelmChartConfigs, error) { return config.HelmCharts.Priority() }
+	return NewHelmReconciler(c, h,
+		WithChartSelector(prioritySelector),
+		WithCustomPhase(upgrade.PhasePriorityHelmCharts),
+		WithStrictUpgradePolicy(),
+	)
+}
+
+// NewStandardHelmReconciler returns a Helm reconciler that reconciles only the charts that are part of the standard upgrade workflow.
+func NewStandardHelmReconciler(c client.Client, h helm.Client) *HelmReconciler {
+	standardSelector := func(config *upgrade.Config) (upgrade.HelmChartConfigs, error) { return config.HelmCharts.Standard() }
+	return NewHelmReconciler(c, h, WithChartSelector(standardSelector))
 }
 
 func (r *HelmReconciler) Phase() upgrade.Phase {
-	return upgrade.PhaseHelmCharts
+	return r.phase
 }
 
 func (r *HelmReconciler) Reconcile(ctx context.Context, config *upgrade.Config) (*upgrade.PhaseStatus, error) {
-	if config == nil || config.HelmCharts == nil || len(config.HelmCharts) == 0 {
+	if config == nil {
 		return r.Phase().SkippedStatus(), nil
 	}
 
-	return r.reconcileHelmCharts(ctx, config.ReleaseNamespacedName.Name, config.ReleaseVersion, config.HelmCharts)
+	charts, err := r.chartSelector(config)
+	if err != nil {
+		return &upgrade.PhaseStatus{
+			State:   lifecyclev1alpha1.UpgradeFailed,
+			Message: fmt.Sprintf("Failed to resolve charts for upgrade: %v", err),
+		}, err
+	}
+
+	if len(charts) == 0 {
+		return r.Phase().SkippedStatus(), nil
+	}
+
+	return r.reconcileHelmCharts(ctx, config.ReleaseNamespacedName.Name, config.ReleaseVersion, charts)
 }
 
 // reconcileHelmCharts ensures the HelmChart resources exist and are up to date.
@@ -100,18 +161,10 @@ func (r *HelmReconciler) reconcileHelmCharts(ctx context.Context, releaseName, r
 	r.releaseName = releaseName
 	r.releaseVersion = releaseVersion
 
-	orderedChartConfigs, err := sortChartConfigsByDependencies(chartConfigs)
-	if err != nil {
-		return &upgrade.PhaseStatus{
-			State:   lifecyclev1alpha1.UpgradeFailed,
-			Message: fmt.Sprintf("Failed to resolve chart dependencies: %v", err),
-		}, err
-	}
-
-	logger.Info("Reconciling Helm charts", "count", len(orderedChartConfigs))
+	logger.Info("Reconciling Helm charts", "count", len(chartConfigs))
 
 	var results []chartUpgradeResult
-	for _, chartConfig := range orderedChartConfigs {
+	for _, chartConfig := range chartConfigs {
 		chartName := chartConfig.Chart.GetName()
 		state, err := r.reconcileChart(ctx, chartConfig)
 		if err != nil {
@@ -142,61 +195,7 @@ func (r *HelmReconciler) reconcileHelmCharts(ctx context.Context, releaseName, r
 		}
 	}
 
-	return r.aggregateResults(results, len(orderedChartConfigs)), nil
-}
-
-// sortChartConfigsByDependencies returns a sorted slice of chart configurations,
-// where configuration for chart dependencies come before their respective dependent chart configurations.
-func sortChartConfigsByDependencies(chartConfigs []*upgrade.HelmChartConfig) ([]*upgrade.HelmChartConfig, error) {
-	chartConfigMap := make(map[string]*upgrade.HelmChartConfig)
-	for _, chartConfig := range chartConfigs {
-		chartConfigMap[chartConfig.Chart.GetName()] = chartConfig
-	}
-
-	// Track visited and in-progress for cycle detection
-	visited, inProgress := make(map[string]bool), make(map[string]bool)
-	var result []*upgrade.HelmChartConfig
-
-	var visit func(name string) error
-	visit = func(name string) error {
-		if inProgress[name] {
-			return fmt.Errorf("circular dependency detected involving chart %s", name)
-		}
-		if visited[name] {
-			return nil
-		}
-
-		chartConfig, exists := chartConfigMap[name]
-		if !exists {
-			// Chart not in our list, skip (it might be an external dependency)
-			return nil
-		}
-
-		inProgress[name] = true
-
-		// Visit dependencies first
-		for _, dep := range chartConfig.Chart.DependsOn {
-			if dep.Type == api.DependencyTypeHelm {
-				if err := visit(dep.Name); err != nil {
-					return err
-				}
-			}
-		}
-
-		inProgress[name] = false
-		visited[name] = true
-		result = append(result, chartConfig)
-
-		return nil
-	}
-
-	for _, chartConfig := range chartConfigs {
-		if err := visit(chartConfig.Chart.GetName()); err != nil {
-			return nil, err
-		}
-	}
-
-	return result, nil
+	return r.aggregateResults(results, len(chartConfigs)), nil
 }
 
 // reconcileChart reconciles a single chart and returns its state.

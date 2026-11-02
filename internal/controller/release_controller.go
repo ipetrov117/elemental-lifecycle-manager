@@ -211,7 +211,7 @@ func (r *ReleaseReconciler) reconcileNormal(ctx context.Context, release *lifecy
 }
 
 func (r *ReleaseReconciler) reconcileLCM(ctx context.Context, config *upgrade.Config) (*upgrade.PhaseStatus, error) {
-	lcmReconciler := reconcilers.NewHelmReconciler(r.Client, r.HelmClient, true)
+	lcmReconciler := reconcilers.NewHelmReconciler(r.Client, r.HelmClient, reconcilers.WithStrictUpgradePolicy())
 	status, err := lcmReconciler.Reconcile(ctx, config)
 	if err != nil {
 		return &upgrade.PhaseStatus{},
@@ -439,17 +439,10 @@ func (r *ReleaseReconciler) parseUpgradeConfig(ctx context.Context, manifest *re
 		return nil, fmt.Errorf("parsing drain options: %w", err)
 	}
 
-	runtimeConfig := &upgrade.RuntimeConfig{DrainOpts: opts, HelmCharts: runtimeHelmChartConfigs(release)}
-
-	config, err = upgrade.NewConfig(manifest, release.Spec.Version, types.NamespacedName{Name: release.Name, Namespace: release.Namespace}, runtimeConfig)
-	if err != nil {
-		return nil, err
-	}
-	// remove LCM related charts from config because they should be updated by self-upgrade phase
-	config.HelmCharts = slices.DeleteFunc(config.HelmCharts, func(c *upgrade.HelmChartConfig) bool {
-		return slices.Contains([]string{elementalLifecycleManager, elementalLifecycleManagerCRDs}, c.Chart.Chart)
-	})
-	return config, nil
+	return upgrade.NewConfig(manifest,
+		release.Spec.Version,
+		types.NamespacedName{Name: release.Name, Namespace: release.Namespace},
+		&upgrade.RuntimeConfig{DrainOpts: opts, HelmCharts: runtimeHelmChartConfigs(release)})
 }
 
 // cleanupOldVersionPlans deletes SUC Plans from a previous version.
