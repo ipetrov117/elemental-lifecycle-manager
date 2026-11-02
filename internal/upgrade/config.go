@@ -41,7 +41,7 @@ type Config struct {
 	// Kubernetes contains all upgrade configurations related to the target Kubernetes distribution.
 	Kubernetes *KubernetesConfig
 	// HelmCharts contains all target Helm charts that need to be upgraded.
-	HelmCharts []*HelmChartConfig
+	HelmCharts HelmChartConfigs
 }
 
 // OSConfig contains configurations related to a specific operating system upgrade.
@@ -70,6 +70,99 @@ type DrainOpts struct {
 	ControlPlane bool
 	// Worker specifies that worker nodes need to be drained.
 	Worker bool
+}
+
+type HelmChartConfigs []*HelmChartConfig
+
+// Priority returns all priority charts and their dependencies from 'h',
+// excluding the special Elemental Lifecycle Manager charts. The returned slice
+// is ordered so that dependencies always precede their dependents.
+func (h HelmChartConfigs) Priority() (HelmChartConfigs, error) {
+	prioritySelector := func(c *HelmChartConfig) bool {
+		if c.RuntimeConfig.PriorityUpgrade != nil {
+			return *c.RuntimeConfig.PriorityUpgrade
+		}
+
+		return c.Chart.PriorityUpgrade
+	}
+
+	charts, err := h.FilterWithDependencies(prioritySelector)
+	// Remove LCM charts, as their upgrade is not part of the standard priority
+	// chart upgrade workflow.
+	return slices.DeleteFunc(charts, isLCMChart), err
+
+}
+
+// Standard returns all non-priority charts and their dependencies from 'h',
+// excluding the special Elemental Lifecycle Manager charts. The returned slice
+// is ordered so that dependencies always precede their dependents.
+func (h HelmChartConfigs) Standard() (HelmChartConfigs, error) {
+	standardSelector := func(c *HelmChartConfig) bool {
+		if c.RuntimeConfig.PriorityUpgrade != nil {
+			return !*c.RuntimeConfig.PriorityUpgrade
+		}
+		return !c.Chart.PriorityUpgrade
+	}
+
+	charts, err := h.FilterWithDependencies(standardSelector)
+	// Remove LCM charts, as their upgrade is not part of the standard chart upgrade workflow.
+	return slices.DeleteFunc(charts, isLCMChart), err
+}
+
+// LCM returns the Elemental Lifecycle Manager charts from 'h', with the CRD dependency always
+// coming before the root chart.
+func (h HelmChartConfigs) LCM() (HelmChartConfigs, error) {
+	charts, err := h.FilterWithDependencies(isLCMChart)
+	return slices.DeleteFunc(charts, func(c *HelmChartConfig) bool { return !isLCMChart(c) }), err
+}
+
+// FilterWithDependencies returns a filtered subset from 'h' based on the provided selection criteria.
+// The returned subset is ordered with dependencies always coming before their dependent charts.
+func (h HelmChartConfigs) FilterWithDependencies(choose func(*HelmChartConfig) bool) (HelmChartConfigs, error) {
+	chartMap := make(map[string]*HelmChartConfig, len(h))
+	for _, c := range h {
+		chartMap[c.Chart.GetName()] = c
+	}
+
+	var ordered HelmChartConfigs
+	visited, inProgress := make(map[string]bool), make(map[string]bool)
+
+	var visit func(c *HelmChartConfig) error
+	visit = func(c *HelmChartConfig) error {
+		name := c.Chart.GetName()
+		if visited[name] {
+			return nil
+		}
+		if inProgress[name] {
+			return fmt.Errorf("circular dependency detected involving chart %s", name)
+		}
+
+		inProgress[name] = true
+		for _, dep := range c.Chart.DependsOn {
+			if d, ok := chartMap[dep.Name]; ok && dep.Type == api.DependencyTypeHelm {
+				if err := visit(d); err != nil {
+					return err
+				}
+			}
+		}
+		inProgress[name] = false
+
+		visited[name] = true
+		ordered = append(ordered, c)
+		return nil
+	}
+
+	for _, c := range h {
+		if !choose(c) {
+			continue
+		}
+
+		if err := visit(c); err != nil {
+			return nil, err
+		}
+	}
+
+	return ordered, nil
 }
 
 // HelmChartConfig contains the configuration for a Helm Controller HelmChart resource.
@@ -223,4 +316,8 @@ func BuildHelmChartConfig(core, solution *api.Helm, runtimeConfigs map[string]Ru
 	}
 
 	return chartConfig, nil
+}
+
+func isLCMChart(h *HelmChartConfig) bool {
+	return h.Chart.Chart == "elemental-lifecycle-manager" || h.Chart.Chart == "elemental-lifecycle-manager-crds"
 }

@@ -18,6 +18,7 @@ limitations under the License.
 package upgrade
 
 import (
+	"slices"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -37,11 +38,13 @@ const (
 	baseOSVersion    = "16.0"
 	k8sVersion       = "1.35.1"
 	k8sImage         = "registry.com/rke2-tar:1.35.1"
+	lcmChartName     = "elemental-lifecycle-manager"
+	lcmCRDChartName  = "elemental-lifecycle-manager-crds"
 )
 
 var (
-	coreChart            = &api.HelmChart{Chart: "foo", Repository: "foo-repo"}
-	solutionChart        = &api.HelmChart{Chart: "bar", Repository: "bar-repo"}
+	coreChart            = &api.HelmChart{Chart: "foo", Repository: "foo-repo"} //nolint:goconst
+	solutionChart        = &api.HelmChart{Chart: "bar", Repository: "bar-repo"} //nolint:goconst
 	coreChartRepo        = &api.HelmRepository{Name: "foo-repo", URL: "https://charts.foo.com"}
 	solutionChartRepo    = &api.HelmRepository{Name: "bar-repo", URL: "https://charts.bar.com"}
 	corePlatformManifest = &core.ReleaseManifest{
@@ -198,3 +201,165 @@ var _ = Describe("Configuration creation", func() {
 		Expect(config.HelmCharts[1]).To(Equal(solutionHelmChartConfig))
 	})
 })
+
+//nolint:goconst
+var _ = Describe("Helm chart selection", func() {
+	DescribeTable("FilterWithDependencies",
+		func(charts HelmChartConfigs, choose func(*HelmChartConfig) bool, expected []string) {
+			selected, err := charts.FilterWithDependencies(choose)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(chartNames(selected)).To(Equal(expected))
+		},
+		Entry("when no charts are selected",
+			HelmChartConfigs{standardChart("foo"), standardChart("bar")},
+			selectByName(),
+			[]string{},
+		),
+		Entry("when charts and dependencies are selected",
+			HelmChartConfigs{standardChart("foo", "bar"), standardChart("bar")},
+			selectAll,
+			[]string{"bar", "foo"},
+		),
+		Entry("when a chart with dependency is selected",
+			HelmChartConfigs{standardChart("foo", "bar"), standardChart("bar"), standardChart("baz")},
+			selectByName("foo"),
+			[]string{"bar", "foo"},
+		),
+		Entry("when a chart with transitive dependency is selected",
+			HelmChartConfigs{standardChart("foo", "bar"), standardChart("bar", "baz"), standardChart("baz"), standardChart("pippo")},
+			selectByName("foo"),
+			[]string{"baz", "bar", "foo"},
+		),
+		Entry("when selected charts share a dependency",
+			HelmChartConfigs{standardChart("foo", "baz"), standardChart("bar", "baz"), standardChart("baz"), standardChart("pippo")},
+			selectAll,
+			[]string{"baz", "foo", "bar", "pippo"},
+		),
+		Entry("when dependency is not a chart",
+			HelmChartConfigs{
+				{
+					Chart: &api.HelmChart{
+						Chart:     "foo",
+						DependsOn: []api.HelmChartDependency{{Name: "bar", Type: api.DependencyTypeExtension}},
+					},
+				},
+				standardChart("bar"),
+			},
+			selectByName("foo"),
+			[]string{"foo"},
+		),
+		Entry("when dependency is missing",
+			HelmChartConfigs{standardChart("foo", "missing")},
+			selectAll,
+			[]string{"foo"},
+		),
+	)
+
+	It("should fail on circular dependencies", func() {
+		charts := HelmChartConfigs{priorityChart("foo", "bar"), standardChart("bar", "foo")}
+
+		selected, err := charts.FilterWithDependencies(selectByName("foo"))
+		Expect(err).To(MatchError("circular dependency detected involving chart foo"))
+		Expect(selected).To(BeNil())
+
+		_, err = charts.Priority()
+		Expect(err).To(MatchError("circular dependency detected involving chart foo"))
+
+		_, err = charts.Standard()
+		Expect(err).To(MatchError("circular dependency detected involving chart bar"))
+	})
+
+	DescribeTable("Runtime priority configuration",
+		func(chartPriority bool, runtimePriority *bool, expectedPriority, expectedStandard []string) {
+			c := newChartConfig("foo", chartPriority)
+			c.RuntimeConfig.PriorityUpgrade = runtimePriority
+			charts := HelmChartConfigs{c}
+
+			Expect(charts.Priority()).To(WithTransform(chartNames, Equal(expectedPriority)))
+			Expect(charts.Standard()).To(WithTransform(chartNames, Equal(expectedStandard)))
+		},
+		Entry("when priority chart is not edited at runtime", true, nil, []string{"foo"}, []string{}),
+		Entry("when standard chart is not edited at runtime", false, nil, []string{}, []string{"foo"}),
+		Entry("when priority chart is overridden at runtime", true, new(false), []string{}, []string{"foo"}),
+		Entry("when stamdard chart is overridden at runtime", false, new(true), []string{"foo"}, []string{}),
+	)
+
+	It("should include dependencies across different chart types", func() {
+		charts := HelmChartConfigs{
+			priorityChart("foo", "bar"),
+			standardChart("bar"),
+			standardChart("baz", "pippo"),
+			priorityChart("pippo"),
+		}
+
+		priority, err := charts.Priority()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chartNames(priority)).To(Equal([]string{"bar", "foo", "pippo"}))
+
+		standard, err := charts.Standard()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chartNames(standard)).To(Equal([]string{"bar", "pippo", "baz"}))
+	})
+
+	It("should exclude LCM charts from priority/standard chart outputs", func() {
+		charts := HelmChartConfigs{
+			priorityChart(lcmCRDChartName),
+			standardChart(lcmChartName),
+			priorityChart("foo", lcmChartName),
+			standardChart("bar", lcmCRDChartName),
+		}
+
+		priority, err := charts.Priority()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chartNames(priority)).To(Equal([]string{"foo"}))
+
+		standard, err := charts.Standard()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chartNames(standard)).To(Equal([]string{"bar"}))
+	})
+
+	It("should select only LCM charts", func() {
+		charts := HelmChartConfigs{
+			priorityChart("foo"),
+			priorityChart(lcmChartName, lcmCRDChartName),
+			standardChart("bar"),
+			standardChart(lcmCRDChartName),
+		}
+
+		lcm, err := charts.LCM()
+
+		Expect(err).NotTo(HaveOccurred())
+		Expect(chartNames(lcm)).To(Equal([]string{lcmCRDChartName, lcmChartName}))
+	})
+})
+
+func newChartConfig(name string, priority bool, helmDeps ...string) *HelmChartConfig {
+	deps := make([]api.HelmChartDependency, len(helmDeps))
+	for i, dep := range helmDeps {
+		deps[i] = api.HelmChartDependency{Name: dep, Type: api.DependencyTypeHelm}
+	}
+	return &HelmChartConfig{Chart: &api.HelmChart{Chart: name, PriorityUpgrade: priority, DependsOn: deps}}
+}
+
+func priorityChart(name string, helmDeps ...string) *HelmChartConfig {
+	return newChartConfig(name, true, helmDeps...)
+}
+
+func standardChart(name string, helmDeps ...string) *HelmChartConfig {
+	return newChartConfig(name, false, helmDeps...)
+}
+
+func chartNames(charts HelmChartConfigs) []string {
+	names := make([]string, 0, len(charts))
+	for _, c := range charts {
+		names = append(names, c.Chart.GetName())
+	}
+	return names
+}
+
+func selectAll(*HelmChartConfig) bool { return true }
+
+func selectByName(names ...string) func(*HelmChartConfig) bool {
+	return func(c *HelmChartConfig) bool { return slices.Contains(names, c.Chart.GetName()) }
+}
